@@ -1,15 +1,23 @@
 import 'dart:ui' as ui;
 
 import 'package:flame/components.dart';
+import 'package:flame/events.dart';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:flame/game.dart';
 import 'package:flutter/material.dart';
 
-class RunnerGame extends FlameGame {
+enum GameState {
+  playing,
+  won,
+  intro,
+  gameOver,
+}
+
+class RunnerGame extends FlameGame with TapCallbacks {
+  GameState gameState = GameState.intro;
   Player? player;
   late double groundHeight;
-  // cache loaded image and keep references to created background/ground components
   ui.Image? _groundImage;
   ui.Image? _spikeImage;
   Uint8List? _spikePixels;
@@ -17,45 +25,43 @@ class RunnerGame extends FlameGame {
   Uint8List? _doorPixels;
   Vector2? _doorNaturalSize;
   Rect? _doorRect;
-  int? _groundTopTrim; // rows of transparent pixels at top of the image
+  int? _groundTopTrim;
   final List<Component> _groundComponents = [];
   final List<Component> _spikeComponents = [];
+  final List<Component> _homingSpikes = [];
   final double _playerStartX = 100.0;
 
   @override
   Future<void> onLoad() async {
     await super.onLoad();
-    // load ground image; actual sizing and placement will happen in onGameResize
-    const groundAssetKey = 'map.png';
-    await images.load(groundAssetKey);
-    _groundImage = images.fromCache(groundAssetKey);
-    // compute top transparent trim once
+    await images.load('map.png');
+    _groundImage = images.fromCache('map.png');
     _groundTopTrim = await _computeTopNonTransparent(_groundImage!);
-    // load spike image if available
-    const spikeKey = 'pinchos.png';
+
     try {
-      await images.load(spikeKey);
-      _spikeImage = images.fromCache(spikeKey);
+      await images.load('pinchos.png');
+      _spikeImage = images.fromCache('pinchos.png');
       final bd = await _spikeImage!.toByteData(format: ui.ImageByteFormat.rawRgba);
       _spikePixels = bd?.buffer.asUint8List();
     } catch (_) {
       _spikeImage = null;
     }
-    // load door image if available
-    const doorKey = 'puerta.png';
+
     try {
-      await images.load(doorKey);
-      _doorImage = images.fromCache(doorKey);
+      await images.load('puerta.png');
+      _doorImage = images.fromCache('puerta.png');
       final bd2 = await _doorImage!.toByteData(format: ui.ImageByteFormat.rawRgba);
       _doorPixels = bd2?.buffer.asUint8List();
     } catch (_) {
       _doorImage = null;
       _doorPixels = null;
     }
-    // image loaded - attempt build with current size (onGameResize will also rebuild)
+
     if (size != Vector2.zero()) {
       _buildScene(size);
     }
+    // Start in intro state, wait for a tap to begin
+    gameState = GameState.intro;
   }
 
   Future<int> _computeTopNonTransparent(ui.Image image) async {
@@ -84,28 +90,25 @@ class RunnerGame extends FlameGame {
   }
 
   void _buildScene(Vector2 canvasSize) {
-    // if the ground image isn't loaded yet, skip building (onLoad will call _buildScene)
-    if (_groundImage == null) {
-      return;
-    }
+    if (_groundImage == null) return;
 
-    // remove previous ground/background components
     for (final c in _groundComponents) {
       remove(c);
     }
     _groundComponents.clear();
 
-    // background
+    for (final c in _homingSpikes) {
+      remove(c);
+    }
+    _homingSpikes.clear();
+
     final background = RectangleComponent(position: Vector2.zero(), size: canvasSize, paint: Paint()..color = Colors.lightBlue)
       ..priority = -2;
     add(background);
     _groundComponents.add(background);
 
-    // create tiled ground using the loaded image
     final groundSprite = Sprite(_groundImage!);
     final spriteSize = Vector2(_groundImage!.width.toDouble(), _groundImage!.height.toDouble());
-
-    // cap the ground height to 25% of the screen height (keep natural height otherwise)
     final maxGround = canvasSize.y * 0.25;
     final desiredHeight = spriteSize.y <= maxGround ? spriteSize.y : maxGround;
     final scale = desiredHeight / spriteSize.y;
@@ -124,16 +127,13 @@ class RunnerGame extends FlameGame {
       _groundComponents.add(tile);
     }
 
-    // compute visible top of the ground (where visible pixels start)
     final topTrim = _groundTopTrim ?? 0;
-    final visibleTop = canvasSize.y - groundHeight + topTrim * scale; // where visible pixels start
+    final visibleTop = canvasSize.y - groundHeight + topTrim * scale;
 
-    // place door at right edge (if available)
     _doorRect = null;
     if (_doorImage != null) {
       final doorNatural = Vector2(_doorImage!.width.toDouble(), _doorImage!.height.toDouble());
       _doorNaturalSize = doorNatural;
-      // scale door so it doesn't exceed 1.5x ground height
       final doorHeight = min(doorNatural.y, groundHeight * 1.5);
       final doorScale = doorHeight / doorNatural.y;
       final doorWidth = doorNatural.x * doorScale;
@@ -148,127 +148,129 @@ class RunnerGame extends FlameGame {
       _doorRect = Rect.fromLTWH(doorLeft, visibleTop - doorHeight, doorWidth, doorHeight);
     }
 
-    // place spikes dispersed on the ground if the asset is available
-    for (final c in _spikeComponents) {
-      remove(c);
-    }
-    _spikeComponents.clear();
-    if (_spikeImage != null && _spikePixels != null) {
-      final spikeSprite = Sprite(_spikeImage!);
-      final spikeNatural = Vector2(_spikeImage!.width.toDouble(), _spikeImage!.height.toDouble());
-      // estimate player's max jump height using Player defaults
-      final double playerJumpSpeed = 420.0;
-      final double playerGravity = 900.0;
-      final double maxJump = (playerJumpSpeed * playerJumpSpeed) / (2 * playerGravity);
-      // spike height should be less than player's reachable height
-      final double spikeHeight = (min(groundHeight * 0.5, maxJump * 0.6)).clamp(20.0, groundHeight);
-      final double spikeScale = spikeHeight / spikeNatural.y;
-      final double spikeWidth = spikeNatural.x * spikeScale;
-
-      // generate exactly 3 spikes, randomly dispersed, never near the player's start
-      final int spikeCount = 3;
-      final rand = Random();
-      // player's initial x (we place player at x=100)
-      const double playerStartX = 100.0;
-      final double minDistance = spikeWidth * 1.5; // minimum distance between spikes
-
-      final List<double> spikeXs = [];
-      int attempts = 0;
-      while (spikeXs.length < spikeCount && attempts < 500) {
-        attempts++;
-        final double x = (rand.nextDouble() * (canvasSize.x - spikeWidth)) + spikeWidth / 2;
-        // avoid near player start
-        if ((x - playerStartX).abs() < spikeWidth * 1.5) continue;
-        // avoid being too close to door
-        if (_doorRect != null) {
-          final doorLeft = _doorRect!.left;
-          final doorRight = _doorRect!.right;
-          if (x + spikeWidth / 2 > doorLeft && x - spikeWidth / 2 < doorRight) continue;
-        }
-        // avoid being too close to existing spikes
-        var ok = true;
-        for (final px in spikeXs) {
-          if ((px - x).abs() < minDistance) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) spikeXs.add(x);
-      }
-
-      // fallback: if not enough spikes found, distribute evenly but still avoid player start and door
-      if (spikeXs.length < spikeCount) {
-        spikeXs.clear();
-        for (int i = 0; i < spikeCount; i++) {
-          double x = ((i + 1) * canvasSize.x) / (spikeCount + 1);
-          if ((x - playerStartX).abs() < spikeWidth * 1.5) {
-            x = (x + minDistance).clamp(spikeWidth / 2, canvasSize.x - spikeWidth / 2);
-          }
-          if (_doorRect != null) {
-            final doorLeft = _doorRect!.left;
-            final doorRight = _doorRect!.right;
-            if (x + spikeWidth / 2 > doorLeft && x - spikeWidth / 2 < doorRight) {
-              x = (doorLeft - minDistance).clamp(spikeWidth / 2, canvasSize.x - spikeWidth / 2);
-            }
-          }
-          spikeXs.add(x);
-        }
-      }
-
-      for (final x in spikeXs) {
-        final spike = Spike(
-          sprite: spikeSprite,
-          position: Vector2(x, visibleTop),
-          size: Vector2(spikeWidth, spikeHeight),
-          anchor: Anchor.bottomCenter,
-          pixels: _spikePixels!,
-          naturalSize: spikeNatural,
-        )..priority = 0;
-        add(spike);
-        _spikeComponents.add(spike);
-      }
-    }
-
-    // (re)place player exactly on top of the visible part of the ground
-    if (player != null && player!.isMounted) {
+    if (player != null) {
       remove(player!);
     }
     player = Player(size: Vector2(50, 50));
     player!.position = Vector2(_playerStartX, visibleTop - player!.size.y);
     add(player!);
+
+    _addPinchos(visibleTop);
   }
 
-  void respawnPlayer() {
-    if (player == null) return;
-    final canvasSize = size;
-    final topTrim = _groundTopTrim ?? 0;
-    final spriteHeight = _groundImage!.height.toDouble();
-    final desiredHeight = groundHeight;
-    final scale = desiredHeight / spriteHeight;
-    final visibleTop = canvasSize.y - groundHeight + topTrim * scale;
-    player!.position = Vector2(_playerStartX, visibleTop - player!.size.y);
-    player!.velocity = Vector2.zero();
-    player!.invulnerable = 1.0; // 1 second invulnerability after respawn
+  void _addPinchos(double visibleTop) {
+    for (final c in _spikeComponents) {
+      remove(c);
+    }
+    _spikeComponents.clear();
+
+    if (_spikeImage != null && _spikePixels != null) {
+      final spikeSprite = Sprite(_spikeImage!);
+      final spikeNatural = Vector2(_spikeImage!.width.toDouble(), _spikeImage!.height.toDouble());
+      final double playerJumpSpeed = 420.0;
+      final double playerGravity = 900.0;
+      final double maxJump = (playerJumpSpeed * playerJumpSpeed) / (2 * playerGravity);
+      final double spikeHeight = (min(groundHeight * 0.5, maxJump * 0.6)).clamp(20.0, groundHeight);
+      final double spikeScale = spikeHeight / spikeNatural.y;
+      final double spikeWidth = spikeNatural.x * spikeScale;
+
+      // Posiciones fijas para los pinchos
+      final List<double> spikeXs = [
+        size.x * 0.3,
+        size.x * 0.5,
+        size.x * 0.7,
+      ];
+
+      for (int i = 0; i < spikeXs.length; i++) {
+        final x = spikeXs[i];
+        // El último pincho será el que se mueve
+        if (i == spikeXs.length - 1) {
+          final homingSpike = HomingSpike(
+            target: player!,
+            speed: 250.0, // Velocidad reducida para que sea más fácil
+            startDelay: 1.5,
+            sprite: spikeSprite,
+            position: Vector2(x, visibleTop),
+            size: Vector2(spikeWidth, spikeHeight),
+            anchor: Anchor.bottomCenter,
+          )..priority = 0;
+          add(homingSpike);
+          _homingSpikes.add(homingSpike);
+        } else {
+          final spike = Spike(
+            sprite: spikeSprite,
+            position: Vector2(x, visibleTop),
+            size: Vector2(spikeWidth, spikeHeight),
+            anchor: Anchor.bottomCenter,
+            pixels: _spikePixels!,
+            naturalSize: spikeNatural,
+          )..priority = 0;
+          add(spike);
+          _spikeComponents.add(spike);
+        }
+      }
+    }
+  }
+
+  void onPlayerDied() {
+    if (gameState == GameState.playing) {
+      gameState = GameState.gameOver;
+      overlays.add('GameOver');
+      pauseEngine();
+    }
+  }
+
+  @override
+  void onTapDown(TapDownEvent event) {
+    if (gameState == GameState.intro) {
+      startGame();
+    } else if (gameState == GameState.playing) {
+      player?.jump();
+    }
+  }
+
+  void startGame() {
+    gameState = GameState.playing;
+    overlays.remove('intro');
+    resumeEngine();
+  }
+
+  void resetGame() {
+    // Eliminar overlays
+    overlays.remove('GameOver');
+    overlays.remove('win');
+
+    // Reiniciar estado y reconstruir la escena
+    gameState = GameState.playing;
+    _buildScene(size);
+    if (player != null) {
+      player!.invulnerable = 1.0; // Dar un segundo de invulnerabilidad
+    }
+    resumeEngine();
   }
 
   void onLevelComplete() {
-    overlays.add('LevelComplete');
+    if (gameState == GameState.playing) {
+      gameState = GameState.won;
+      pauseEngine();
+      overlays.add('win');
+    }
   }
 
-  void restartLevel() {
-    // hide overlay and rebuild scene with new random spikes
-    overlays.remove('LevelComplete');
-    _buildScene(size);
+  void moveLeftStart() {
+    if (gameState == GameState.playing) player?.moveLeft = true;
   }
-
-  void moveLeftStart() => player?.moveLeft = true;
-  void moveRightStart() => player?.moveRight = true;
+  void moveRightStart() {
+    if (gameState == GameState.playing) player?.moveRight = true;
+  }
   void moveStop() {
     player?.moveLeft = false;
     player?.moveRight = false;
   }
 
-  void jump() => player?.jump();
+  void jump() {
+    if (gameState == GameState.playing) player?.jump();
+  }
 }
 
 class Player extends PositionComponent with HasGameRef<RunnerGame> {
@@ -277,7 +279,9 @@ class Player extends PositionComponent with HasGameRef<RunnerGame> {
   bool moveRight = false;
   double invulnerable = 0.0;
 
-  final double speed = 200;
+  final double acceleration = 1000;
+  final double maxSpeed = 300;
+  final double friction = 400;
   final double gravity = 900;
   final double jumpSpeed = -420;
 
@@ -287,24 +291,37 @@ class Player extends PositionComponent with HasGameRef<RunnerGame> {
   Future<void> onLoad() async {
     await super.onLoad();
     anchor = Anchor.topLeft;
-  }
-
-  @override
-  void render(Canvas canvas) {
-    final paint = Paint()..color = Colors.red;
-    canvas.drawRect(size.toRect(), paint);
+    add(RectangleComponent(
+      size: size,
+      paint: Paint()..color = Colors.red,
+    ));
   }
 
   @override
   void update(double dt) {
     super.update(dt);
 
+    if (gameRef.gameState != GameState.playing) {
+      // Si el juego no está en 'playing', no actualizar movimiento.
+      // Aplicar fricción para que el personaje se detenga.
+      if (velocity.x > 0) {
+        velocity.x = (velocity.x - friction * dt).clamp(0, maxSpeed);
+      } else if (velocity.x < 0) {
+        velocity.x = (velocity.x + friction * dt).clamp(-maxSpeed, 0);
+      }
+      return;
+    }
+
     if (moveLeft) {
-      velocity.x = -speed;
+      velocity.x = (velocity.x - acceleration * dt).clamp(-maxSpeed, maxSpeed);
     } else if (moveRight) {
-      velocity.x = speed;
+      velocity.x = (velocity.x + acceleration * dt).clamp(-maxSpeed, maxSpeed);
     } else {
-      velocity.x = 0;
+      if (velocity.x > 0) {
+        velocity.x = (velocity.x - friction * dt).clamp(0, maxSpeed);
+      } else if (velocity.x < 0) {
+        velocity.x = (velocity.x + friction * dt).clamp(-maxSpeed, 0);
+      }
     }
 
     velocity.y += gravity * dt;
@@ -316,115 +333,96 @@ class Player extends PositionComponent with HasGameRef<RunnerGame> {
       velocity.y = 0;
     }
 
-    // keep within horizontal bounds
-    if (position.x < 0) position.x = 0;
-    if (position.x + size.x > gameRef.size.x) position.x = gameRef.size.x - size.x;
+    if (position.x < 0) {
+      position.x = 0;
+      if(velocity.x < 0) velocity.x = 0;
+    }
+    if (position.x + size.x > gameRef.size.x) {
+      position.x = gameRef.size.x - size.x;
+      if(velocity.x > 0) velocity.x = 0;
+    }
 
-    // reduce invulnerability timer
     if (invulnerable > 0) {
       invulnerable -= dt;
       if (invulnerable < 0) invulnerable = 0;
     }
 
-    // collision with spikes (only if not invulnerable) - pixel-perfect
     if (invulnerable <= 0) {
       final playerRect = Rect.fromLTWH(position.x, position.y, size.x, size.y);
       for (final c in gameRef._spikeComponents) {
         if (c is Spike) {
-          final sx = c.position.x;
-          final sy = c.position.y;
-          final sw = c.size.x;
-          final sh = c.size.y;
-          final spikeLeft = sx - sw / 2;
-          final spikeTop = sy - sh;
-          final spikeRect = Rect.fromLTWH(spikeLeft, spikeTop, sw, sh);
-          if (!playerRect.overlaps(spikeRect)) continue;
-
-          // compute overlapping rect in world coords
-          final overlap = playerRect.intersect(spikeRect);
-          if (overlap.width <= 0 || overlap.height <= 0) continue;
-
-          // map overlap area to spike image pixels and test alpha
-          final int imgW = c.naturalSize.x.toInt();
-          final int imgH = c.naturalSize.y.toInt();
-          final Uint8List px = c.pixels;
-
-          // sample every 2 pixels to save work
-          final int stepX = max(1, (overlap.width / 20).floor());
-          final int stepY = max(1, (overlap.height / 20).floor());
-
-          bool hit = false;
-          for (double wy = overlap.top; wy < overlap.bottom && !hit; wy += stepY) {
-            for (double wx = overlap.left; wx < overlap.right; wx += stepX) {
-              final localX = wx - spikeLeft; // 0..sw
-              final localY = wy - spikeTop; // 0..sh
-              int imgX = ((localX / sw) * imgW).floor();
-              int imgY = ((localY / sh) * imgH).floor();
-              imgX = imgX.clamp(0, imgW - 1);
-              imgY = imgY.clamp(0, imgH - 1);
-              final idx = (imgY * imgW + imgX) * 4;
-              final a = px[idx + 3];
-              if (a > 10) {
-                hit = true;
-                break;
-              }
-            }
-          }
-          if (hit) {
-            gameRef.respawnPlayer();
-            break;
+          if (_checkPixelPerfectCollision(playerRect, c)) {
+            gameRef.onPlayerDied();
+            return;
           }
         }
       }
     }
     
-      // detect collision with door (pixel-perfect if door pixels available)
-      if (gameRef._doorRect != null) {
-        final playerRect2 = Rect.fromLTWH(position.x, position.y, size.x, size.y);
-        final doorRect = gameRef._doorRect!;
-        if (playerRect2.overlaps(doorRect)) {
-          // if we have pixel data for the door, do pixel-perfect check
-          if (gameRef._doorPixels != null && gameRef._doorNaturalSize != null) {
-            final overlap = playerRect2.intersect(doorRect);
-            if (overlap.width > 0 && overlap.height > 0) {
-              final int imgW = gameRef._doorNaturalSize!.x.toInt();
-              final int imgH = gameRef._doorNaturalSize!.y.toInt();
-              final Uint8List px = gameRef._doorPixels!;
-
-              final double sw = doorRect.width;
-              final double sh = doorRect.height;
-              final double spikeLeft = doorRect.left; // reuse naming
-              final double spikeTop = doorRect.top;
-
-              final int stepX = max(1, (overlap.width / 20).floor());
-              final int stepY = max(1, (overlap.height / 20).floor());
-              bool doorHit = false;
-              for (double wy = overlap.top; wy < overlap.bottom && !doorHit; wy += stepY) {
-                for (double wx = overlap.left; wx < overlap.right && !doorHit; wx += stepX) {
-                  final localX = wx - spikeLeft; // 0..sw
-                  final localY = wy - spikeTop; // 0..sh
-                  int imgX = ((localX / sw) * imgW).floor();
-                  int imgY = ((localY / sh) * imgH).floor();
-                  imgX = imgX.clamp(0, imgW - 1);
-                  imgY = imgY.clamp(0, imgH - 1);
-                  final idx = (imgY * imgW + imgX) * 4;
-                  final a = px[idx + 3];
-                  if (a > 10) {
-                    doorHit = true;
-                    break;
-                  }
-                }
-              }
-              if (doorHit) {
-                gameRef.onLevelComplete();
-              }
-            }
-          } else {
-            // fallback to bounding-box
+    if (gameRef._doorRect != null) {
+      final playerRect2 = Rect.fromLTWH(position.x, position.y, size.x, size.y);
+      final doorRect = gameRef._doorRect!;
+      if (playerRect2.overlaps(doorRect)) {
+        if (gameRef._doorPixels != null && gameRef._doorNaturalSize != null) {
+          if (_checkPixelPerfectDoorCollision(playerRect2, doorRect)) {
             gameRef.onLevelComplete();
           }
+        } else {
+          gameRef.onLevelComplete();
         }
       }
+    }
+  }
+
+  bool _checkPixelPerfectCollision(Rect playerRect, Spike spike) {
+    final spikeRect = Rect.fromLTWH(spike.position.x - spike.size.x / 2, spike.position.y - spike.size.y, spike.size.x, spike.size.y);
+    if (!playerRect.overlaps(spikeRect)) return false;
+
+    final overlap = playerRect.intersect(spikeRect);
+    if (overlap.width <= 0 || overlap.height <= 0) return false;
+
+    final int imgW = spike.naturalSize.x.toInt();
+    final int imgH = spike.naturalSize.y.toInt();
+    final Uint8List px = spike.pixels;
+
+    final int stepX = max(1, (overlap.width / 10).floor());
+    final int stepY = max(1, (overlap.height / 10).floor());
+
+    for (double wy = overlap.top; wy < overlap.bottom; wy += stepY) {
+      for (double wx = overlap.left; wx < overlap.right; wx += stepX) {
+        final localX = wx - (spike.position.x - spike.size.x / 2);
+        final localY = wy - (spike.position.y - spike.size.y);
+        int imgX = ((localX / spike.size.x) * imgW).floor().clamp(0, imgW - 1);
+        int imgY = ((localY / spike.size.y) * imgH).floor().clamp(0, imgH - 1);
+        final idx = (imgY * imgW + imgX) * 4;
+        if (px[idx + 3] > 10) return true;
+      }
+    }
+    return false;
+  }
+
+  bool _checkPixelPerfectDoorCollision(Rect playerRect, Rect doorRect) {
+    final overlap = playerRect.intersect(doorRect);
+    if (overlap.width <= 0 || overlap.height <= 0) return false;
+
+    final int imgW = gameRef._doorNaturalSize!.x.toInt();
+    final int imgH = gameRef._doorNaturalSize!.y.toInt();
+    final Uint8List px = gameRef._doorPixels!;
+
+    final int stepX = max(1, (overlap.width / 10).floor());
+    final int stepY = max(1, (overlap.height / 10).floor());
+
+    for (double wy = overlap.top; wy < overlap.bottom; wy += stepY) {
+      for (double wx = overlap.left; wx < overlap.right; wx += stepX) {
+        final localX = wx - doorRect.left;
+        final localY = wy - doorRect.top;
+        int imgX = ((localX / doorRect.width) * imgW).floor().clamp(0, imgW - 1);
+        int imgY = ((localY / doorRect.height) * imgH).floor().clamp(0, imgH - 1);
+        final idx = (imgY * imgW + imgX) * 4;
+        if (px[idx + 3] > 10) return true;
+      }
+    }
+    return false;
   }
 
   void jump() {
@@ -447,4 +445,64 @@ class Spike extends SpriteComponent {
     required this.pixels,
     required this.naturalSize,
   }) : super(sprite: sprite, position: position ?? Vector2.zero(), size: size ?? Vector2.zero(), anchor: anchor ?? Anchor.topLeft);
+}
+
+class HomingSpike extends SpriteComponent with HasGameRef<RunnerGame> {
+  final Player target;
+  final double speed;
+  final double startDelay;
+  double _timeSinceSpawn = 0.0;
+  bool _isMoving = false;
+  double? _targetX;
+
+  HomingSpike({
+    required this.target,
+    required this.speed,
+    this.startDelay = 0.0,
+    Sprite? sprite,
+    Vector2? position,
+    Vector2? size,
+    Anchor? anchor,
+  }) : super(sprite: sprite, position: position, size: size, anchor: anchor);
+
+  @override
+  void update(double dt) {
+    super.update(dt);
+
+    if (gameRef.gameState != GameState.playing) {
+      return; // No se mueve si el juego no está en estado 'playing'
+    }
+
+    if (!target.isMounted) {
+      removeFromParent();
+      return;
+    }
+
+    if (!_isMoving) {
+      _timeSinceSpawn += dt;
+      if (_timeSinceSpawn >= startDelay) {
+        _isMoving = true;
+        _targetX = target.position.x + target.size.x / 2;
+      } else {
+        return;
+      }
+    }
+
+    if (_targetX != null) {
+      final directionX = (_targetX! - position.x).sign;
+      position.x += directionX * speed * dt;
+
+      if ((directionX > 0 && position.x >= _targetX!) || (directionX < 0 && position.x <= _targetX!)) {
+        position.x = _targetX!;
+        _targetX = null; // Detenerse al llegar al objetivo
+      }
+    }
+
+    if (toRect().overlaps(target.toRect())) {
+      if (target.invulnerable <= 0) {
+        gameRef.onPlayerDied();
+        removeFromParent();
+      }
+    }
+  }
 }

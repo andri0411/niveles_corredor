@@ -57,8 +57,8 @@ Future<void> main() async {
                   GestureDetector(
                     onTap: () => g.jump(),
                     child: Container(
-                      width: 100,
-                      height: 100,
+                      width: 80,
+                      height: 80,
                       decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(16)),
                       child: const Icon(Icons.arrow_upward, color: Colors.white, size: 36),
                     ),
@@ -79,13 +79,35 @@ Future<void> main() async {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Text('Has pasado el nivel', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                const Text('Has ganado', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 12),
                 ElevatedButton(
                   onPressed: () {
-                    g.restartLevel();
+                    g.resetGame();
                   },
                   child: const Text('Volver a jugar'),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+      'GameOver': (context, game) {
+        final RunnerGame g = game as RunnerGame;
+        return Center(
+          child: Container(
+            padding: const EdgeInsets.all(20),
+            decoration: BoxDecoration(color: Colors.black.withOpacity(0.7), borderRadius: BorderRadius.circular(12)),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('Game Over', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
+                const SizedBox(height: 12),
+                ElevatedButton(
+                  onPressed: () {
+                    g.resetGame();
+                  },
+                  child: const Text('Reintentar'),
                 ),
               ],
             ),
