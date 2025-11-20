@@ -6,13 +6,12 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:flame/game.dart';
 import 'package:flutter/material.dart';
+import 'player/player.dart';
+import 'obstacles/spikes.dart';
+import 'obstacles/spike_manager.dart';
+import 'scene/scene_builder.dart';
 
-enum GameState {
-  playing,
-  won,
-  intro,
-  gameOver,
-}
+enum GameState { playing, won, intro, gameOver }
 
 class RunnerGame extends FlameGame with TapCallbacks {
   GameState gameState = GameState.intro;
@@ -22,8 +21,12 @@ class RunnerGame extends FlameGame with TapCallbacks {
   ui.Image? _spikeImage;
   Uint8List? _spikePixels;
   ui.Image? _doorImage;
+  // These are read dynamically by `Player` (outside this file).
+  // ignore: unused_field
   Uint8List? _doorPixels;
+  // ignore: unused_field
   Vector2? _doorNaturalSize;
+  // ignore: unused_field
   Rect? _doorRect;
   int? _groundTopTrim;
   final List<Component> _groundComponents = [];
@@ -41,7 +44,9 @@ class RunnerGame extends FlameGame with TapCallbacks {
     try {
       await images.load('pinchos.png');
       _spikeImage = images.fromCache('pinchos.png');
-      final bd = await _spikeImage!.toByteData(format: ui.ImageByteFormat.rawRgba);
+      final bd = await _spikeImage!.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      );
       _spikePixels = bd?.buffer.asUint8List();
     } catch (_) {
       _spikeImage = null;
@@ -50,7 +55,9 @@ class RunnerGame extends FlameGame with TapCallbacks {
     try {
       await images.load('puerta.png');
       _doorImage = images.fromCache('puerta.png');
-      final bd2 = await _doorImage!.toByteData(format: ui.ImageByteFormat.rawRgba);
+      final bd2 = await _doorImage!.toByteData(
+        format: ui.ImageByteFormat.rawRgba,
+      );
       _doorPixels = bd2?.buffer.asUint8List();
     } catch (_) {
       _doorImage = null;
@@ -102,37 +109,24 @@ class RunnerGame extends FlameGame with TapCallbacks {
     }
     _homingSpikes.clear();
 
-    final background = RectangleComponent(position: Vector2.zero(), size: canvasSize, paint: Paint()..color = Colors.lightBlue)
-      ..priority = -2;
-    add(background);
-    _groundComponents.add(background);
-
-    final groundSprite = Sprite(_groundImage!);
-    final spriteSize = Vector2(_groundImage!.width.toDouble(), _groundImage!.height.toDouble());
-    final maxGround = canvasSize.y * 0.25;
-    final desiredHeight = spriteSize.y <= maxGround ? spriteSize.y : maxGround;
-    final scale = desiredHeight / spriteSize.y;
-    final tileWidth = spriteSize.x * scale;
-    groundHeight = desiredHeight;
-
-    final tiles = (canvasSize.x / tileWidth).ceil() + 1;
-    for (int i = 0; i < tiles; i++) {
-      final tile = SpriteComponent(
-        sprite: groundSprite,
-        position: Vector2(i * tileWidth, canvasSize.y),
-        size: Vector2(tileWidth, groundHeight),
-        anchor: Anchor.bottomLeft,
-      )..priority = -1;
-      add(tile);
-      _groundComponents.add(tile);
+    final scene = buildGroundParts(
+      _groundImage!,
+      canvasSize,
+      _groundTopTrim ?? 0,
+    );
+    for (final c in scene.components) {
+      add(c);
+      _groundComponents.add(c);
     }
-
-    final topTrim = _groundTopTrim ?? 0;
-    final visibleTop = canvasSize.y - groundHeight + topTrim * scale;
+    groundHeight = scene.groundHeight;
+    final visibleTop = scene.visibleTop;
 
     _doorRect = null;
     if (_doorImage != null) {
-      final doorNatural = Vector2(_doorImage!.width.toDouble(), _doorImage!.height.toDouble());
+      final doorNatural = Vector2(
+        _doorImage!.width.toDouble(),
+        _doorImage!.height.toDouble(),
+      );
       _doorNaturalSize = doorNatural;
       final doorHeight = min(doorNatural.y, groundHeight * 1.5);
       final doorScale = doorHeight / doorNatural.y;
@@ -145,7 +139,12 @@ class RunnerGame extends FlameGame with TapCallbacks {
       )..priority = 1;
       add(doorComponent);
       final doorLeft = canvasSize.x - doorWidth;
-      _doorRect = Rect.fromLTWH(doorLeft, visibleTop - doorHeight, doorWidth, doorHeight);
+      _doorRect = Rect.fromLTWH(
+        doorLeft,
+        visibleTop - doorHeight,
+        doorWidth,
+        doorHeight,
+      );
     }
 
     if (player != null) {
@@ -159,55 +158,41 @@ class RunnerGame extends FlameGame with TapCallbacks {
   }
 
   void _addPinchos(double visibleTop) {
-    for (final c in _spikeComponents) {
-      remove(c);
-    }
+    // Remove previous spikes
+    for (final c in _spikeComponents) remove(c);
     _spikeComponents.clear();
+    for (final c in _homingSpikes) remove(c);
+    _homingSpikes.clear();
 
     if (_spikeImage != null && _spikePixels != null) {
       final spikeSprite = Sprite(_spikeImage!);
-      final spikeNatural = Vector2(_spikeImage!.width.toDouble(), _spikeImage!.height.toDouble());
-      final double playerJumpSpeed = 420.0;
-      final double playerGravity = 900.0;
-      final double maxJump = (playerJumpSpeed * playerJumpSpeed) / (2 * playerGravity);
-      final double spikeHeight = (min(groundHeight * 0.5, maxJump * 0.6)).clamp(20.0, groundHeight);
-      final double spikeScale = spikeHeight / spikeNatural.y;
-      final double spikeWidth = spikeNatural.x * spikeScale;
+      final spikeNatural = Vector2(
+        _spikeImage!.width.toDouble(),
+        _spikeImage!.height.toDouble(),
+      );
+      final result = createSpikesForScene(
+        spikeSprite: spikeSprite,
+        spikeNatural: spikeNatural,
+        spikePixels: _spikePixels!,
+        visibleTop: visibleTop,
+        groundHeight: groundHeight,
+        canvasWidth: size.x,
+      );
 
-      // Posiciones fijas para los pinchos
-      final List<double> spikeXs = [
-        size.x * 0.3,
-        size.x * 0.5,
-        size.x * 0.7,
-      ];
-
-      for (int i = 0; i < spikeXs.length; i++) {
-        final x = spikeXs[i];
-        // El último pincho será el que se mueve
-        if (i == spikeXs.length - 1) {
-          final homingSpike = HomingSpike(
-            target: player!,
-            speed: 250.0, // Velocidad reducida para que sea más fácil
-            startDelay: 1.5,
-            sprite: spikeSprite,
-            position: Vector2(x, visibleTop),
-            size: Vector2(spikeWidth, spikeHeight),
-            anchor: Anchor.bottomCenter,
-          )..priority = 0;
-          add(homingSpike);
-          _homingSpikes.add(homingSpike);
-        } else {
-          final spike = Spike(
-            sprite: spikeSprite,
-            position: Vector2(x, visibleTop),
-            size: Vector2(spikeWidth, spikeHeight),
-            anchor: Anchor.bottomCenter,
-            pixels: _spikePixels!,
-            naturalSize: spikeNatural,
-          )..priority = 0;
-          add(spike);
-          _spikeComponents.add(spike);
-        }
+      for (final s in result.spikes) {
+        s.priority = 0;
+        add(s);
+        _spikeComponents.add(s);
+      }
+      for (final h in result.homingSpikes) {
+        // assign target now that player exists
+        // HomingSpike.target is typed as dynamic in obstacles, so we set via cast
+        try {
+          (h as dynamic).target = player;
+        } catch (_) {}
+        h.priority = 0;
+        add(h);
+        _homingSpikes.add(h);
       }
     }
   }
@@ -225,7 +210,14 @@ class RunnerGame extends FlameGame with TapCallbacks {
     if (gameState == GameState.intro) {
       startGame();
     } else if (gameState == GameState.playing) {
-      player?.jump();
+      player?.pressJump();
+    }
+  }
+
+  @override
+  void onTapUp(TapUpEvent event) {
+    if (gameState == GameState.playing) {
+      player?.releaseJump();
     }
   }
 
@@ -260,9 +252,11 @@ class RunnerGame extends FlameGame with TapCallbacks {
   void moveLeftStart() {
     if (gameState == GameState.playing) player?.moveLeft = true;
   }
+
   void moveRightStart() {
     if (gameState == GameState.playing) player?.moveRight = true;
   }
+
   void moveStop() {
     player?.moveLeft = false;
     player?.moveRight = false;
@@ -271,111 +265,51 @@ class RunnerGame extends FlameGame with TapCallbacks {
   void jump() {
     if (gameState == GameState.playing) player?.jump();
   }
-}
-
-class Player extends PositionComponent with HasGameRef<RunnerGame> {
-  Vector2 velocity = Vector2.zero();
-  bool moveLeft = false;
-  bool moveRight = false;
-  double invulnerable = 0.0;
-
-  final double acceleration = 1000;
-  final double maxSpeed = 300;
-  final double friction = 400;
-  final double gravity = 900;
-  final double jumpSpeed = -420;
-
-  Player({Vector2? position, Vector2? size}) : super(position: position ?? Vector2.zero(), size: size ?? Vector2(50, 50));
-
-  @override
-  Future<void> onLoad() async {
-    await super.onLoad();
-    anchor = Anchor.topLeft;
-    add(RectangleComponent(
-      size: size,
-      paint: Paint()..color = Colors.red,
-    ));
-  }
 
   @override
   void update(double dt) {
     super.update(dt);
 
-    if (gameRef.gameState != GameState.playing) {
-      // Si el juego no está en 'playing', no actualizar movimiento.
-      // Aplicar fricción para que el personaje se detenga.
-      if (velocity.x > 0) {
-        velocity.x = (velocity.x - friction * dt).clamp(0, maxSpeed);
-      } else if (velocity.x < 0) {
-        velocity.x = (velocity.x + friction * dt).clamp(-maxSpeed, 0);
-      }
-      return;
-    }
+    // Centralizar detección de colisiones aquí: si el jugador toca un pincho => morir
+    if (player == null || !player!.isMounted) return;
 
-    if (moveLeft) {
-      velocity.x = (velocity.x - acceleration * dt).clamp(-maxSpeed, maxSpeed);
-    } else if (moveRight) {
-      velocity.x = (velocity.x + acceleration * dt).clamp(-maxSpeed, maxSpeed);
-    } else {
-      if (velocity.x > 0) {
-        velocity.x = (velocity.x - friction * dt).clamp(0, maxSpeed);
-      } else if (velocity.x < 0) {
-        velocity.x = (velocity.x + friction * dt).clamp(-maxSpeed, 0);
-      }
-    }
-
-    velocity.y += gravity * dt;
-    position += velocity * dt;
-
-    final groundY = gameRef.size.y - gameRef.groundHeight;
-    if (position.y + size.y >= groundY) {
-      position.y = groundY - size.y;
-      velocity.y = 0;
-    }
-
-    if (position.x < 0) {
-      position.x = 0;
-      if(velocity.x < 0) velocity.x = 0;
-    }
-    if (position.x + size.x > gameRef.size.x) {
-      position.x = gameRef.size.x - size.x;
-      if(velocity.x > 0) velocity.x = 0;
-    }
-
-    if (invulnerable > 0) {
-      invulnerable -= dt;
-      if (invulnerable < 0) invulnerable = 0;
-    }
-
-    if (invulnerable <= 0) {
-      final playerRect = Rect.fromLTWH(position.x, position.y, size.x, size.y);
-      for (final c in gameRef._spikeComponents) {
+    if (player!.invulnerable <= 0 && gameState == GameState.playing) {
+      final playerRect = Rect.fromLTWH(
+        player!.position.x,
+        player!.position.y,
+        player!.size.x,
+        player!.size.y,
+      );
+      for (final c in _spikeComponents) {
         if (c is Spike) {
           if (_checkPixelPerfectCollision(playerRect, c)) {
-            gameRef.onPlayerDied();
+            onPlayerDied();
             return;
           }
         }
       }
-    }
-    
-    if (gameRef._doorRect != null) {
-      final playerRect2 = Rect.fromLTWH(position.x, position.y, size.x, size.y);
-      final doorRect = gameRef._doorRect!;
-      if (playerRect2.overlaps(doorRect)) {
-        if (gameRef._doorPixels != null && gameRef._doorNaturalSize != null) {
-          if (_checkPixelPerfectDoorCollision(playerRect2, doorRect)) {
-            gameRef.onLevelComplete();
+
+      if (_doorRect != null) {
+        if (playerRect.overlaps(_doorRect!)) {
+          if (_doorPixels != null && _doorNaturalSize != null) {
+            if (_checkPixelPerfectDoorCollision(playerRect, _doorRect!)) {
+              onLevelComplete();
+            }
+          } else {
+            onLevelComplete();
           }
-        } else {
-          gameRef.onLevelComplete();
         }
       }
     }
   }
 
   bool _checkPixelPerfectCollision(Rect playerRect, Spike spike) {
-    final spikeRect = Rect.fromLTWH(spike.position.x - spike.size.x / 2, spike.position.y - spike.size.y, spike.size.x, spike.size.y);
+    final spikeRect = Rect.fromLTWH(
+      spike.position.x - spike.size.x / 2,
+      spike.position.y - spike.size.y,
+      spike.size.x,
+      spike.size.y,
+    );
     if (!playerRect.overlaps(spikeRect)) return false;
 
     final overlap = playerRect.intersect(spikeRect);
@@ -405,9 +339,9 @@ class Player extends PositionComponent with HasGameRef<RunnerGame> {
     final overlap = playerRect.intersect(doorRect);
     if (overlap.width <= 0 || overlap.height <= 0) return false;
 
-    final int imgW = gameRef._doorNaturalSize!.x.toInt();
-    final int imgH = gameRef._doorNaturalSize!.y.toInt();
-    final Uint8List px = gameRef._doorPixels!;
+    final int imgW = _doorNaturalSize!.x.toInt();
+    final int imgH = _doorNaturalSize!.y.toInt();
+    final Uint8List px = _doorPixels!;
 
     final int stepX = max(1, (overlap.width / 10).floor());
     final int stepY = max(1, (overlap.height / 10).floor());
@@ -416,93 +350,18 @@ class Player extends PositionComponent with HasGameRef<RunnerGame> {
       for (double wx = overlap.left; wx < overlap.right; wx += stepX) {
         final localX = wx - doorRect.left;
         final localY = wy - doorRect.top;
-        int imgX = ((localX / doorRect.width) * imgW).floor().clamp(0, imgW - 1);
-        int imgY = ((localY / doorRect.height) * imgH).floor().clamp(0, imgH - 1);
+        int imgX = ((localX / doorRect.width) * imgW).floor().clamp(
+          0,
+          imgW - 1,
+        );
+        int imgY = ((localY / doorRect.height) * imgH).floor().clamp(
+          0,
+          imgH - 1,
+        );
         final idx = (imgY * imgW + imgX) * 4;
         if (px[idx + 3] > 10) return true;
       }
     }
     return false;
-  }
-
-  void jump() {
-    final groundY = gameRef.size.y - gameRef.groundHeight;
-    if ((position.y + size.y) >= groundY - 0.5) {
-      velocity.y = jumpSpeed;
-    }
-  }
-}
-
-class Spike extends SpriteComponent {
-  final Uint8List pixels;
-  final Vector2 naturalSize;
-
-  Spike({
-    Sprite? sprite,
-    Vector2? position,
-    Vector2? size,
-    Anchor? anchor,
-    required this.pixels,
-    required this.naturalSize,
-  }) : super(sprite: sprite, position: position ?? Vector2.zero(), size: size ?? Vector2.zero(), anchor: anchor ?? Anchor.topLeft);
-}
-
-class HomingSpike extends SpriteComponent with HasGameRef<RunnerGame> {
-  final Player target;
-  final double speed;
-  final double startDelay;
-  double _timeSinceSpawn = 0.0;
-  bool _isMoving = false;
-  double? _targetX;
-
-  HomingSpike({
-    required this.target,
-    required this.speed,
-    this.startDelay = 0.0,
-    Sprite? sprite,
-    Vector2? position,
-    Vector2? size,
-    Anchor? anchor,
-  }) : super(sprite: sprite, position: position, size: size, anchor: anchor);
-
-  @override
-  void update(double dt) {
-    super.update(dt);
-
-    if (gameRef.gameState != GameState.playing) {
-      return; // No se mueve si el juego no está en estado 'playing'
-    }
-
-    if (!target.isMounted) {
-      removeFromParent();
-      return;
-    }
-
-    if (!_isMoving) {
-      _timeSinceSpawn += dt;
-      if (_timeSinceSpawn >= startDelay) {
-        _isMoving = true;
-        _targetX = target.position.x + target.size.x / 2;
-      } else {
-        return;
-      }
-    }
-
-    if (_targetX != null) {
-      final directionX = (_targetX! - position.x).sign;
-      position.x += directionX * speed * dt;
-
-      if ((directionX > 0 && position.x >= _targetX!) || (directionX < 0 && position.x <= _targetX!)) {
-        position.x = _targetX!;
-        _targetX = null; // Detenerse al llegar al objetivo
-      }
-    }
-
-    if (toRect().overlaps(target.toRect())) {
-      if (target.invulnerable <= 0) {
-        gameRef.onPlayerDied();
-        removeFromParent();
-      }
-    }
   }
 }
