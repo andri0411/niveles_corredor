@@ -1,8 +1,11 @@
 import 'package:flame/components.dart';
 import 'dart:typed_data';
+import '../game_api.dart';
 
 class Spike extends SpriteComponent {
   final Uint8List pixels;
+  // Precomputed alpha mask: 1 for opaque, 0 for transparent, length = imgW * imgH
+  final Uint8List alphaMask;
   final Vector2 naturalSize;
 
   Spike({
@@ -11,6 +14,7 @@ class Spike extends SpriteComponent {
     Vector2? size,
     Anchor? anchor,
     required this.pixels,
+    required this.alphaMask,
     required this.naturalSize,
   }) : super(
          sprite: sprite,
@@ -24,7 +28,9 @@ class Spike extends SpriteComponent {
 /// usamos tipos dinámicos para evitar import circular. Se asume que
 /// `target` expone `position`, `size`, `toRect()` y (opcional) `invulnerable`.
 class HomingSpike extends SpriteComponent with HasGameRef {
-  final dynamic target;
+  // `target` must be mutable so caller can assign the player after
+  // constructing the spike (avoids circular import issues).
+  dynamic target;
   final double speed;
   final double startDelay;
   double _timeSinceSpawn = 0.0;
@@ -32,7 +38,7 @@ class HomingSpike extends SpriteComponent with HasGameRef {
   double? _targetX;
 
   HomingSpike({
-    required this.target,
+    this.target,
     required this.speed,
     this.startDelay = 0.0,
     Sprite? sprite,
@@ -44,30 +50,13 @@ class HomingSpike extends SpriteComponent with HasGameRef {
   @override
   void update(double dt) {
     super.update(dt);
-
-    // Intentamos acceder a gameRef.gameState si existe, con dinámica para evitar dependencia fuerte
-    try {
-      final gs = (gameRef as dynamic).gameState;
-      if (gs != null && gs != (gameRef as dynamic).gameState) {}
-    } catch (_) {}
-
-    try {
-      if ((gameRef as dynamic).gameState != null &&
-          (gameRef as dynamic).gameState != (gameRef as dynamic).gameState) {}
-    } catch (_) {}
-
-    try {
-      if ((gameRef as dynamic).gameState != null &&
-          (gameRef as dynamic).gameState != (gameRef as dynamic).gameState) {}
-    } catch (_) {}
-
-    // If game is not playing, don't move (best-effort, dynamic access)
-    try {
-      if ((gameRef as dynamic).gameState != null &&
-          (gameRef as dynamic).gameState != (gameRef as dynamic).gameState) {}
-    } catch (_) {}
-
-    // Fallback: proceed unless the game explicitly stops movement elsewhere
+    // Use the typed GameApi when available.
+    if (gameRef is GameApi) {
+      final GameApi gr = gameRef as GameApi;
+      if (gr.gameState != GameState.playing) return;
+    } else {
+      return;
+    }
 
     if (target == null) return;
 
@@ -75,11 +64,8 @@ class HomingSpike extends SpriteComponent with HasGameRef {
       _timeSinceSpawn += dt;
       if (_timeSinceSpawn >= startDelay) {
         _isMoving = true;
-        try {
-          _targetX = target.position.x + target.size.x / 2;
-        } catch (_) {
-          _targetX = (target as dynamic).position.x;
-        }
+        // assume caller assigned a valid target (player) with position/size
+        _targetX = target.position.x + target.size.x / 2;
       } else {
         return;
       }
@@ -96,16 +82,14 @@ class HomingSpike extends SpriteComponent with HasGameRef {
       }
     }
 
-    try {
-      if (toRect().overlaps((target as dynamic).toRect())) {
-        final inv = (target as dynamic).invulnerable ?? 0;
-        if (inv <= 0) {
-          try {
-            (gameRef as dynamic).onPlayerDied();
-          } catch (_) {}
-          removeFromParent();
+    if (toRect().overlaps((target as dynamic).toRect())) {
+      final inv = (target as dynamic).invulnerable ?? 0;
+      if (inv <= 0) {
+        if (gameRef is GameApi) {
+          (gameRef as GameApi).onPlayerDied();
         }
+        removeFromParent();
       }
-    } catch (_) {}
+    }
   }
 }

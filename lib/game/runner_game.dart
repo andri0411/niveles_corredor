@@ -10,10 +10,11 @@ import 'player/player.dart';
 import 'obstacles/spikes.dart';
 import 'obstacles/spike_manager.dart';
 import 'scene/scene_builder.dart';
+import 'game_api.dart';
+import 'collision_utils.dart';
 
-enum GameState { playing, won, intro, gameOver }
-
-class RunnerGame extends FlameGame with TapCallbacks {
+class RunnerGame extends FlameGame with TapCallbacks implements GameApi {
+  @override
   GameState gameState = GameState.intro;
   Player? player;
   late double groundHeight;
@@ -170,6 +171,10 @@ class RunnerGame extends FlameGame with TapCallbacks {
         _spikeImage!.width.toDouble(),
         _spikeImage!.height.toDouble(),
       );
+      // Decide how many spikes to create based on canvas width so that
+      // larger screens get more obstacles. Minimum 3.
+      final estimated = (size.x / 240).floor();
+      final numSpikes = max(3, estimated);
       final result = createSpikesForScene(
         spikeSprite: spikeSprite,
         spikeNatural: spikeNatural,
@@ -177,6 +182,8 @@ class RunnerGame extends FlameGame with TapCallbacks {
         visibleTop: visibleTop,
         groundHeight: groundHeight,
         canvasWidth: size.x,
+        numSpikes: numSpikes,
+        makeLastHoming: true,
       );
 
       for (final s in result.spikes) {
@@ -186,10 +193,7 @@ class RunnerGame extends FlameGame with TapCallbacks {
       }
       for (final h in result.homingSpikes) {
         // assign target now that player exists
-        // HomingSpike.target is typed as dynamic in obstacles, so we set via cast
-        try {
-          (h as dynamic).target = player;
-        } catch (_) {}
+        h.target = player;
         h.priority = 0;
         add(h);
         _homingSpikes.add(h);
@@ -209,16 +213,15 @@ class RunnerGame extends FlameGame with TapCallbacks {
   void onTapDown(TapDownEvent event) {
     if (gameState == GameState.intro) {
       startGame();
-    } else if (gameState == GameState.playing) {
-      player?.pressJump();
     }
+    // Do not trigger jumps from generic taps on the game area. Jump should
+    // only be triggered via the dedicated jump button to avoid accidental
+    // jumps when touching the screen.
   }
 
   @override
   void onTapUp(TapUpEvent event) {
-    if (gameState == GameState.playing) {
-      player?.releaseJump();
-    }
+    // No-op: jump release is handled by the jump button overlay only.
   }
 
   void startGame() {
@@ -266,6 +269,22 @@ class RunnerGame extends FlameGame with TapCallbacks {
     if (gameState == GameState.playing) player?.jump();
   }
 
+  // Input helpers for low-latency pointer forwarding from Flutter widgets.
+  void pressJumpImmediate() {
+    if (gameState == GameState.playing) player?.pressJump();
+    // Start latency timer for this jump input
+    _lastPointerDownWatch = Stopwatch()..start();
+    _waitingForJumpLatency = true;
+  }
+
+  void releaseJumpImmediate() {
+    if (gameState == GameState.playing) player?.releaseJump();
+  }
+
+  // Latency measurement helpers
+  Stopwatch? _lastPointerDownWatch;
+  bool _waitingForJumpLatency = false;
+
   @override
   void update(double dt) {
     super.update(dt);
@@ -282,7 +301,7 @@ class RunnerGame extends FlameGame with TapCallbacks {
       );
       for (final c in _spikeComponents) {
         if (c is Spike) {
-          if (_checkPixelPerfectCollision(playerRect, c)) {
+          if (checkPixelPerfectCollision(playerRect, c)) {
             onPlayerDied();
             return;
           }
@@ -292,7 +311,12 @@ class RunnerGame extends FlameGame with TapCallbacks {
       if (_doorRect != null) {
         if (playerRect.overlaps(_doorRect!)) {
           if (_doorPixels != null && _doorNaturalSize != null) {
-            if (_checkPixelPerfectDoorCollision(playerRect, _doorRect!)) {
+            if (checkPixelPerfectDoorCollision(
+              playerRect,
+              _doorRect!,
+              _doorNaturalSize!,
+              _doorPixels!,
+            )) {
               onLevelComplete();
             }
           } else {
@@ -301,67 +325,24 @@ class RunnerGame extends FlameGame with TapCallbacks {
         }
       }
     }
-  }
 
-  bool _checkPixelPerfectCollision(Rect playerRect, Spike spike) {
-    final spikeRect = Rect.fromLTWH(
-      spike.position.x - spike.size.x / 2,
-      spike.position.y - spike.size.y,
-      spike.size.x,
-      spike.size.y,
-    );
-    if (!playerRect.overlaps(spikeRect)) return false;
-
-    final overlap = playerRect.intersect(spikeRect);
-    if (overlap.width <= 0 || overlap.height <= 0) return false;
-
-    final int imgW = spike.naturalSize.x.toInt();
-    final int imgH = spike.naturalSize.y.toInt();
-    final Uint8List px = spike.pixels;
-
-    final int stepX = max(1, (overlap.width / 10).floor());
-    final int stepY = max(1, (overlap.height / 10).floor());
-
-    for (double wy = overlap.top; wy < overlap.bottom; wy += stepY) {
-      for (double wx = overlap.left; wx < overlap.right; wx += stepX) {
-        final localX = wx - (spike.position.x - spike.size.x / 2);
-        final localY = wy - (spike.position.y - spike.size.y);
-        int imgX = ((localX / spike.size.x) * imgW).floor().clamp(0, imgW - 1);
-        int imgY = ((localY / spike.size.y) * imgH).floor().clamp(0, imgH - 1);
-        final idx = (imgY * imgW + imgX) * 4;
-        if (px[idx + 3] > 10) return true;
-      }
+    // Latency measurement: if we were waiting for a jump to be applied,
+    // consider it occurred when player's vertical velocity becomes negative.
+    if (_waitingForJumpLatency && player!.velocity.y < 0) {
+      final elapsed = _lastPointerDownWatch?.elapsedMilliseconds ?? -1;
+      debugPrint('Jump latency: ${elapsed}ms');
+      _lastPointerDownWatch?.stop();
+      _waitingForJumpLatency = false;
     }
-    return false;
-  }
-
-  bool _checkPixelPerfectDoorCollision(Rect playerRect, Rect doorRect) {
-    final overlap = playerRect.intersect(doorRect);
-    if (overlap.width <= 0 || overlap.height <= 0) return false;
-
-    final int imgW = _doorNaturalSize!.x.toInt();
-    final int imgH = _doorNaturalSize!.y.toInt();
-    final Uint8List px = _doorPixels!;
-
-    final int stepX = max(1, (overlap.width / 10).floor());
-    final int stepY = max(1, (overlap.height / 10).floor());
-
-    for (double wy = overlap.top; wy < overlap.bottom; wy += stepY) {
-      for (double wx = overlap.left; wx < overlap.right; wx += stepX) {
-        final localX = wx - doorRect.left;
-        final localY = wy - doorRect.top;
-        int imgX = ((localX / doorRect.width) * imgW).floor().clamp(
-          0,
-          imgW - 1,
-        );
-        int imgY = ((localY / doorRect.height) * imgH).floor().clamp(
-          0,
-          imgH - 1,
-        );
-        final idx = (imgY * imgW + imgX) * 4;
-        if (px[idx + 3] > 10) return true;
-      }
+    // Timeout: if too long without jump, reset the waiting flag
+    if (_waitingForJumpLatency &&
+        _lastPointerDownWatch != null &&
+        _lastPointerDownWatch!.elapsedMilliseconds > 1000) {
+      debugPrint('Jump latency: timeout >1000ms');
+      _lastPointerDownWatch?.stop();
+      _waitingForJumpLatency = false;
     }
-    return false;
   }
+
+  // Collision helpers have been moved to `collision_utils.dart`.
 }
